@@ -229,7 +229,17 @@ def find_tied_parameters(model: nn.Module, **kwargs):
                 # When we find one, it has to be one of the existing parameters.
                 for new_name, new_param in named_parameters.items():
                     if new_param is parameter:
-                        result[new_name] = full_name
+                        if new_name in result and not isinstance(result[new_name], list):
+                            result[new_name] = [result[new_name], full_name] if full_name != result[new_name] else [result[new_name]]
+                        # elif new_name in result and isinstance(result[new_name], list) and full_name not in result[new_name]:
+                        #     result[new_name].append(full_name)
+                        elif new_name in result:
+                            if full_name in result[new_name]:
+                                pass
+                            else:
+                                result[new_name].append(full_name)
+                        else:
+                            result[new_name] = full_name
 
     # Once we have treated direct parameters, we move to the child modules.
     for name, child in model.named_children():
@@ -249,15 +259,24 @@ def retie_parameters(model, tied_params):
         tied_params (`Dict[str, str]`):
             A mapping parameter name to tied parameter name as obtained by `find_tied_parameters`.
     """
-    for param_name, tied_param_name in tied_params.items():
+    for param_name, tied_param_names in tied_params.items():
         param = model
-        for split in param_name.split("."):
-            param = getattr(param, split)
-        tied_module = model
-        for split in tied_param_name.split(".")[:-1]:
-            tied_module = getattr(tied_module, split)
-        setattr(tied_module, tied_param_name.split(".")[-1], param)
-
+        if isinstance(tied_param_names, str):
+            for split in param_name.split("."):
+                param = getattr(param, split)
+            tied_module = model
+            for split in tied_param_names.split(".")[:-1]:
+                tied_module = getattr(tied_module, split)
+            setattr(tied_module, tied_param_names.split(".")[-1], param)
+        elif isinstance(tied_param_names, list):
+            for tied_param_name in tied_param_names:
+                for split in param_name.split("."):
+                    param = getattr(param, split)
+                tied_module = model
+                for split in tied_param_name.split(".")[:-1]:
+                    tied_module = getattr(tied_module, split)
+                setattr(tied_module, tied_param_name.split(".")[-1], param)
+                param = model
 
 def compute_module_sizes(model: nn.Module, dtype: Optional[Union[str, torch.device]] = None):
     """
@@ -561,7 +580,18 @@ def infer_auto_device_map(
         module_size = module_sizes[name]
         # We keep relevant tied parameters only: once of the tied parameters is inside the current module and the other
         # is not.
-        tied_params = [v for k, v in tied_parameters.items() if name in k and name not in v]
+        tied_params = []
+        for tied_param_key, tied_param_value in tied_parameters.items():
+            if isinstance(tied_param_value, str):
+                if name in tied_param_key and name not in tied_param_value:
+                    tied_params.append(tied_param_value)
+            elif isinstance(tied_param_value, list):
+                if name in tied_param_key:
+                    for value in tied_param_value:
+                        if name not in value:
+                            tied_params.append(value)
+
+        # tied_params = [v for k, v in tied_parameters.items() if name in k and name not in v]
         # We ignore parameters that are tied when they're tied to > 1 one
         tied_param = tied_params[0] if len(tied_params) == 1 else None
 
@@ -592,41 +622,79 @@ def infer_auto_device_map(
 
         # Case 2, it fits! We're not entirely out of the wood though, because we may have some tied parameters.
         elif tied_param is not None:
-            # Determine the sized occupied by this module + the module containing the tied parameter
-            tied_module_size = module_size
-            tied_module_index = [i for i, (n, _) in enumerate(modules_to_treat) if n in tied_param][0]
-            tied_module_name, tied_module = modules_to_treat[tied_module_index]
-            tied_module_size += module_sizes[tied_module_name] - module_sizes[tied_param]
-            if current_max_size is not None and current_memory_used + tied_module_size > current_max_size:
-                # Split or not split?
-                tied_module_children = list(tied_module.named_children())
-                if len(tied_module_children) == 0 or tied_module.__class__.__name__ in no_split_module_classes:
-                    # If the tied module is not split, we go to the next device
-                    current_device += 1
-                    modules_to_treat = [(name, module)] + modules_to_treat
-                    current_memory_used = 0
+            if isinstance(tied_param, str):
+                # Determine the sized occupied by this module + the module containing the tied parameter
+                tied_module_size = module_size
+                tied_module_index = [i for i, (n, _) in enumerate(modules_to_treat) if n in tied_param][0]
+                tied_module_name, tied_module = modules_to_treat[tied_module_index]
+                tied_module_size += module_sizes[tied_module_name] - module_sizes[tied_param]
+                if current_max_size is not None and current_memory_used + tied_module_size > current_max_size:
+                    # Split or not split?
+                    tied_module_children = list(tied_module.named_children())
+                    if len(tied_module_children) == 0 or tied_module.__class__.__name__ in no_split_module_classes:
+                        # If the tied module is not split, we go to the next device
+                        current_device += 1
+                        modules_to_treat = [(name, module)] + modules_to_treat
+                        current_memory_used = 0
+                    else:
+                        # Otherwise, we replace the tied module by its children.
+                        tied_module_children = list(tied_module.named_parameters(recurse=False)) + tied_module_children
+                        tied_module_children = [(f"{tied_module_name}.{n}", v) for n, v in tied_module_children]
+                        modules_to_treat = (
+                            [(name, module)]
+                            + modules_to_treat[:tied_module_index]
+                            + tied_module_children
+                            + modules_to_treat[tied_module_index + 1 :]
+                        )
+                        # Update the max layer size.
+                        max_layer_size, max_layer_names = get_max_layer_size(
+                            [(n, m) for n, m in modules_to_treat if isinstance(m, torch.nn.Module)],
+                            module_sizes,
+                            no_split_module_classes,
+                        )
                 else:
-                    # Otherwise, we replace the tied module by its children.
-                    tied_module_children = list(tied_module.named_parameters(recurse=False)) + tied_module_children
-                    tied_module_children = [(f"{tied_module_name}.{n}", v) for n, v in tied_module_children]
-                    modules_to_treat = (
-                        [(name, module)]
-                        + modules_to_treat[:tied_module_index]
-                        + tied_module_children
-                        + modules_to_treat[tied_module_index + 1 :]
-                    )
-                    # Update the max layer size.
-                    max_layer_size, max_layer_names = get_max_layer_size(
-                        [(n, m) for n, m in modules_to_treat if isinstance(m, torch.nn.Module)],
-                        module_sizes,
-                        no_split_module_classes,
-                    )
-            else:
-                # We really really fit!
-                current_memory_used += tied_module_size
-                device_map[name] = devices[current_device]
-                modules_to_treat.pop(tied_module_index)
-                device_map[tied_module_name] = devices[current_device]
+                    # We really really fit!
+                    current_memory_used += tied_module_size
+                    device_map[name] = devices[current_device]
+                    modules_to_treat.pop(tied_module_index)
+                    device_map[tied_module_name] = devices[current_device]
+            elif isinstance(tied_param, list):
+                for tied_param in tied_param:
+                    # Determine the sized occupied by this module + the module containing the tied parameter
+                    tied_module_size = module_size
+                    tied_module_index = [i for i, (n, _) in enumerate(modules_to_treat) if n in tied_param][0]
+                    tied_module_name, tied_module = modules_to_treat[tied_module_index]
+                    tied_module_size += module_sizes[tied_module_name] - module_sizes[tied_param]
+                    if current_max_size is not None and current_memory_used + tied_module_size > current_max_size:
+                        # Split or not split?
+                        tied_module_children = list(tied_module.named_children())
+                        if len(tied_module_children) == 0 or tied_module.__class__.__name__ in no_split_module_classes:
+                            # If the tied module is not split, we go to the next device
+                            current_device += 1
+                            modules_to_treat = [(name, module)] + modules_to_treat
+                            current_memory_used = 0
+                        else:
+                            # Otherwise, we replace the tied module by its children.
+                            tied_module_children = list(tied_module.named_parameters(recurse=False)) + tied_module_children
+                            tied_module_children = [(f"{tied_module_name}.{n}", v) for n, v in tied_module_children]
+                            modules_to_treat = (
+                                [(name, module)]
+                                + modules_to_treat[:tied_module_index]
+                                + tied_module_children
+                                + modules_to_treat[tied_module_index + 1 :]
+                            )
+                            # Update the max layer size.
+                            max_layer_size, max_layer_names = get_max_layer_size(
+                                [(n, m) for n, m in modules_to_treat if isinstance(m, torch.nn.Module)],
+                                module_sizes,
+                                no_split_module_classes,
+                            )
+                    else:
+                        # We really really fit!
+                        current_memory_used += tied_module_size
+                        device_map[name] = devices[current_device]
+                        modules_to_treat.pop(tied_module_index)
+                        device_map[tied_module_name] = devices[current_device]
         else:
             current_memory_used += module_size
             device_map[name] = devices[current_device]
